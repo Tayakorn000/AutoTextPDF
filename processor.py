@@ -272,13 +272,11 @@ class PDFProcessor:
 
                 for i, h_group in enumerate(unique_headers):
                     header_s = h_group["item_s"]; header_y = header_s["y_center"]
+                    item_x = header_s["bbox"][0]
                     qty_x = h_group["qty_s"]["bbox"][0]
-                    v_x = h_group["v_name_s"]["bbox"][0] if h_group["v_name_s"] else (qty_x + 40)
-                    v_on_left = v_x < qty_x
+                    v_x = h_group["v_name_s"]["bbox"][0] if h_group["v_name_s"] else -1
                     
                     next_h_y = unique_headers[i+1]["item_s"]["y_center"] if i+1 < len(unique_headers) else page.rect.height
-                    
-                    # Zone spans
                     zone_spans = sorted([s for s in spans if header_y + 5 < s["y_center"] < next_h_y - 5], key=lambda x: x["y_center"])
                     
                     rows = []
@@ -302,28 +300,24 @@ class PDFProcessor:
                         
                         for s in row:
                             t = s["text"].strip()
-                            # Filter out common PDF noise
                             if not t or any(x in t for x in ["Order ID", "Seller SKU", "Package ID", "Total Amount", "Page ", "Date"]): continue
                             x = s["bbox"][0]
                             
-                            # Check if this span is in the Qty column
-                            is_in_qty_col = False
-                            if v_on_left:
-                                if x > (qty_x - 10): is_in_qty_col = True
-                            else:
-                                if (qty_x - 10) < x < (v_x - 5): is_in_qty_col = True
+                            # Find which header this text is closest to horizontally
+                            dists = [('item', abs(x - item_x)), ('qty', abs(x - qty_x))]
+                            if v_x != -1: dists.append(('v', abs(x - v_x)))
                             
-                            if is_in_qty_col:
-                                # Look for quantity patterns: "2", "x2", "x 2"
+                            closest_col = min(dists, key=lambda d: d[1])[0]
+                            
+                            if closest_col == 'qty':
                                 m = re.search(r'(?:x\s*)?(\d+)', t, re.IGNORECASE)
-                                if m and (len(t) < 5 or t.lower().startswith('x')): # Ensure it's not a long string with a number
+                                if m and (len(t) < 5 or t.lower().startswith('x')):
                                     r_qty = int(m.group(1))
                                 else:
-                                    if v_on_left: r_v.append(t)
+                                    # If not a clear number, fallback to Item or Variant based on other headers
+                                    if v_x != -1 and abs(x - v_x) < abs(x - item_x): r_v.append(t)
                                     else: r_item.append(t)
-                            elif not v_on_left and x > (v_x - 10):
-                                r_v.append(t)
-                            elif v_on_left and (v_x - 10) < x < (qty_x - 5):
+                            elif closest_col == 'v':
                                 r_v.append(t)
                             else:
                                 r_item.append(t)
