@@ -2,6 +2,7 @@ import fitz # PyMuPDF
 import pandas as pd
 import os
 import re
+from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
 import textwrap
 from pypdf import PdfReader, PdfWriter
@@ -102,9 +103,6 @@ class PDFProcessor:
     def add_labels_to_pdf(self, input_pdf, output_pdf, orders_to_label):
         reader = PdfReader(input_pdf)
         writer = PdfWriter()
-        font_size = 18
-        line_height = font_size * 1.2
-        
         is_iship = "iship" in os.path.basename(input_pdf).lower()
         
         for i, page in enumerate(reader.pages):
@@ -115,48 +113,74 @@ class PDFProcessor:
                 h = float(page.mediabox.height)
                 can = canvas.Canvas(packet, pagesize=(w, h))
                 
-                if self.font_path:
-                    try:
-                        pdfmetrics.registerFont(TTFont('ThaiFont', self.font_path))
-                        can.setFont('ThaiFont', font_size)
-                    except: can.setFont('Helvetica-Bold', font_size)
-                else: can.setFont('Helvetica-Bold', font_size)
-                
+                # Group items by zone (Top/Bottom half) so items in the same order share a box
+                zones = defaultdict(list)
                 for order in orders_to_label[page_num]:
-                    raw_code = order['code'].replace("\\n", "\n").strip()
-                    qty = order.get('qty', 1)
-                    
-                    lines = []
-                    for part in raw_code.split("\n"):
-                        part = part.strip()
-                        if part:
-                            part_with_qty = f"{part}......x{qty}"
-                            lines.extend(textwrap.wrap(part_with_qty, width=100))
-                    
-                    max_line_w = max([can.stringWidth(line, can._fontname, font_size) for line in lines])
-                    box_w = max_line_w + 20
-                    box_h = (len(lines) * line_height) + 10
-                    
-                    if is_iship or "ship.pdf" in input_pdf.lower():
-                        rect_x = w - box_w - 15; rect_y = 15
+                    if is_iship or "ship.pdf" in os.path.basename(input_pdf).lower():
+                        zone_key = "full"
                     else:
-                        rect_y = (h / 2) + 15 if order['y_pos'] < h / 2 else 15
-                        rect_x = w - box_w - 15
+                        zone_key = "top" if order['y_pos'] < h/2 else "bottom"
+                    zones[zone_key].append(order)
+                
+                for zone_key, zone_items in zones.items():
+                    all_lines_data = []
+                    zone_items.sort(key=lambda x: x['y_pos'])
                     
-                    can.setFillColorRGB(1, 1, 0)
-                    can.setStrokeColorRGB(1, 0, 0)
-                    can.setLineWidth(1.2)
-                    can.rect(rect_x, rect_y, box_w, box_h, fill=1, stroke=1)
-                    can.setFillColorRGB(1, 0, 0)
-                    for j, line in enumerate(reversed(lines)):
-                        can.drawString(rect_x + 5, rect_y + 8 + (j * line_height), line)
+                    for idx, itm in enumerate(zone_items):
+                        raw_code = itm['code'].replace("\\n", "\n").strip()
+                        qty = itm.get('qty', 1)
+                        if idx > 0:
+                            all_lines_data.append({'text': "", 'qty': 0, 'is_spacer': True})
+                        
+                        # Append qty to EVERY line of this item
+                        item_lines = [l.strip() for l in raw_code.split("\n") if l.strip()]
+                        if not item_lines: continue
+                        for line_text in item_lines:
+                            final_text = f"{line_text}......x{qty}"
+                            all_lines_data.append({
+                                'text': final_text, 'qty': qty, 'is_spacer': False
+                            })
+
+                    if not all_lines_data: continue
+                    font_size = 18; max_box_w = 230
+                    while font_size > 7:
+                        if self.font_path:
+                            try:
+                                pdfmetrics.registerFont(TTFont('ThaiFont', self.font_path))
+                                can.setFont('ThaiFont', font_size)
+                            except: can.setFont('Helvetica-Bold', font_size)
+                        else: can.setFont('Helvetica-Bold', font_size)
+                        max_w = max([can.stringWidth(d['text'], can._fontname, font_size) for d in all_lines_data if not d['is_spacer']])
+                        if max_w < max_box_w: break
+                        font_size -= 1
+                    
+                    line_h = font_size * 1.2; box_w = max_w + 20; box_h = 10
+                    for d in all_lines_data: box_h += (line_h * 0.5 if d['is_spacer'] else line_h)
+                    
+                    if zone_key == "full": rx = w - box_w - 15; ry = 15
+                    elif zone_key == "top": rx = w - box_w - 15; ry = (h / 2) + 15
+                    else: rx = w - box_w - 15; ry = 15
+                    
+                    can.setFillColorRGB(1, 1, 0); can.setStrokeColorRGB(1, 0, 0); can.setLineWidth(1.2)
+                    can.rect(rx, ry, box_w, box_h, fill=1, stroke=1)
+                    can.setFillColorRGB(1, 0, 0); curr_y = ry + 8
+                    for d in reversed(all_lines_data):
+                        if d['is_spacer']: curr_y += line_h * 0.5; continue
+                        can.drawString(rx + 5, curr_y, d['text'])
+                        if d['qty'] > 1:
+                            can.setStrokeColorRGB(1, 0, 0); can.setLineWidth(1.5)
+                            qw = can.stringWidth(f"x{d['qty']}", can._fontname, font_size)
+                            tw = can.stringWidth(d['text'], can._fontname, font_size)
+                            cx = rx + 5 + tw - (qw / 2); cy = curr_y + (font_size * 0.35)
+                            can.circle(cx, cy, font_size * 0.7, fill=0, stroke=1)
+                        curr_y += line_h
                 
                 can.save()
                 packet.seek(0)
                 overlay_reader = PdfReader(packet)
                 page.merge_page(overlay_reader.pages[0])
                 writer.add_page(page)
-            elif not is_iship:
+            else:
                 writer.add_page(page)
                 
         with open(output_pdf, "wb") as f:
@@ -167,10 +191,13 @@ class PDFProcessor:
         self._load_db() 
         all_results = []
         fname_low = os.path.basename(pdf_path).lower()
+        active_headers = None # Track headers across pages for overflows
+        
         try:
             doc = fitz.open(pdf_path)
             
             if "iship" in fname_low:
+                # ... (iship logic remains the same)
                 pending_label = None
                 for p_num in range(len(doc)):
                     page = doc[p_num]
@@ -208,98 +235,154 @@ class PDFProcessor:
                                     "x_center": (span["bbox"][0] + span["bbox"][2]) / 2
                                 })
                 if not spans: continue
+                
                 headers = []
                 spans_sorted = sorted(spans, key=lambda x: x["y_center"])
                 for i, s in enumerate(spans_sorted):
                     txt = s["text"].lower().strip()
-                    if s["y_center"] > 500 and len(headers) == 0: continue 
-                    if "item" == txt:
+                    # Look for Item header
+                    if "item" == txt or "รายการ" == txt:
                         h_info = {"item_s": s, "qty_s": None, "v_name_s": None}
                         for s2 in spans:
                             if s2 == s: continue
                             txt2 = s2["text"].lower().strip()
-                            if abs(s2["y_center"] - s["y_center"]) < 20: 
+                            if abs(s2["y_center"] - s["y_center"]) < 25: 
                                 if "qty" == txt2 or "จำนวน" == txt2: h_info["qty_s"] = s2
-                                if any(x == txt2 for x in ["v name", "v_name", "variant", "รุ่น"]): h_info["v_name_s"] = s2
+                                if any(x == txt2 for x in ["v name", "v_name", "variant", "รุ่น", "แบบ"]): h_info["v_name_s"] = s2
                         if h_info["qty_s"]: headers.append(h_info)
                 
-                headers.sort(key=lambda x: x["item_s"]["y_center"])
-                for i, h_group in enumerate(headers):
+                # If no headers found but we had them on previous page, create a virtual header for continuation
+                if not headers and active_headers:
+                    # Only if there's text at the top of the page (likely a continuation)
+                    if any(s["y_center"] < 200 for s in spans):
+                        headers = [{
+                            "item_s": {"bbox": active_headers["item_s"]["bbox"], "y_center": 0},
+                            "qty_s": active_headers["qty_s"],
+                            "v_name_s": active_headers["v_name_s"]
+                        }]
+
+                # Filter and deduplicate headers
+                unique_headers = []
+                for h in sorted(headers, key=lambda x: x["item_s"]["y_center"]):
+                    if not unique_headers or abs(h["item_s"]["y_center"] - unique_headers[-1]["item_s"]["y_center"]) > 20:
+                        unique_headers.append(h)
+                
+                if unique_headers:
+                    active_headers = unique_headers[-1] # Save the last header for the next page overflow
+
+                for i, h_group in enumerate(unique_headers):
                     header_s = h_group["item_s"]; header_y = header_s["y_center"]
-                    item_start_x = header_s["bbox"][0]
-                    qty_start_x = h_group["qty_s"]["bbox"][0]
-                    v_start_x = h_group["v_name_s"]["bbox"][0] if h_group["v_name_s"] else (qty_start_x + 30)
-                    v_on_left = v_start_x < qty_start_x
-                    next_header_y = headers[i+1]["item_s"]["y_center"] if i+1 < len(headers) else page.rect.height
-                    label_spans = [s for s in spans if header_y + 2 < s["y_center"] < next_header_y - 2]
-                    item_parts, v_parts, qty_parts = [], [], []
-                    for s in label_spans:
-                        t = s["text"].strip()
-                        if not t or "Order ID" in t or "Seller SKU" in t: continue
-                        x_start = s["bbox"][0]
-                        if v_on_left:
-                            if x_start > (v_start_x - 10) and x_start < (qty_start_x - 10): v_parts.append(t)
-                            elif x_start > (qty_start_x - 10):
-                                if t.isdigit() or (t.startswith('x') and t[1:].isdigit()): qty_parts.append(t)
-                            else: item_parts.append(t)
-                        else:
-                            if x_start > (qty_start_x - 10) and x_start < (v_start_x - 10):
-                                if t.isdigit() or (t.startswith('x') and t[1:].isdigit()): qty_parts.append(t)
-                            elif x_start > (v_start_x - 10): v_parts.append(t)
-                            else: item_parts.append(t)
+                    qty_x = h_group["qty_s"]["bbox"][0]
+                    v_x = h_group["v_name_s"]["bbox"][0] if h_group["v_name_s"] else (qty_x + 40)
+                    v_on_left = v_x < qty_x
                     
-                    item_ext = self.clean_thai_text(" ".join(item_parts))
-                    v_ext = self.clean_thai_text(" ".join(v_parts))
-                    qty = 1
-                    try:
-                        qty_str = "".join(qty_parts).replace('x', '')
-                        if qty_str.isdigit(): qty = int(qty_str)
-                    except: pass
+                    next_h_y = unique_headers[i+1]["item_s"]["y_center"] if i+1 < len(unique_headers) else page.rect.height
                     
-                    if item_ext:
-                        item_norm = self._normalize_for_match(item_ext)
-                        v_norm = self._normalize_for_match(v_ext)
+                    # Zone spans
+                    zone_spans = sorted([s for s in spans if header_y + 5 < s["y_center"] < next_h_y - 5], key=lambda x: x["y_center"])
+                    
+                    rows = []
+                    if zone_spans:
+                        cur_row = [zone_spans[0]]
+                        for s_idx in range(1, len(zone_spans)):
+                            if abs(zone_spans[s_idx]["y_center"] - zone_spans[s_idx-1]["y_center"]) < 6:
+                                cur_row.append(zone_spans[s_idx])
+                            else:
+                                rows.append(cur_row)
+                                cur_row = [zone_spans[s_idx]]
+                        rows.append(cur_row)
+                    
+                    items_found = []
+                    cur_item = {'item': [], 'v': [], 'qty': None, 'y': None}
+                    
+                    for row in rows:
+                        r_item, r_v, r_qty = [], [], None
+                        ry = row[0]["y_center"]
+                        row = sorted(row, key=lambda x: x["bbox"][0])
                         
-                        best_code = "NOT FOUND"
-                        best_score = -9999
+                        for s in row:
+                            t = s["text"].strip()
+                            # Filter out common PDF noise
+                            if not t or any(x in t for x in ["Order ID", "Seller SKU", "Package ID", "Total Amount", "Page ", "Date"]): continue
+                            x = s["bbox"][0]
+                            
+                            # Check if this span is in the Qty column
+                            is_in_qty_col = False
+                            if v_on_left:
+                                if x > (qty_x - 10): is_in_qty_col = True
+                            else:
+                                if (qty_x - 10) < x < (v_x - 5): is_in_qty_col = True
+                            
+                            if is_in_qty_col:
+                                # Look for quantity patterns: "2", "x2", "x 2"
+                                m = re.search(r'(?:x\s*)?(\d+)', t, re.IGNORECASE)
+                                if m and (len(t) < 5 or t.lower().startswith('x')): # Ensure it's not a long string with a number
+                                    r_qty = int(m.group(1))
+                                else:
+                                    if v_on_left: r_v.append(t)
+                                    else: r_item.append(t)
+                            elif not v_on_left and x > (v_x - 10):
+                                r_v.append(t)
+                            elif v_on_left and (v_x - 10) < x < (qty_x - 5):
+                                r_v.append(t)
+                            else:
+                                r_item.append(t)
+                        
+                        # LOGIC: Only split into a new item if we see a NEW qty and the current one ALREADY has a qty
+                        if r_qty is not None:
+                            if cur_item['qty'] is not None:
+                                # Current item is complete, save it
+                                items_found.append(cur_item)
+                                cur_item = {'item': r_item, 'v': r_v, 'qty': r_qty, 'y': ry}
+                            else:
+                                # Current item was waiting for a qty
+                                cur_item['item'].extend(r_item)
+                                cur_item['v'].extend(r_v)
+                                cur_item['qty'] = r_qty
+                                if cur_item['y'] is None: cur_item['y'] = ry
+                        else:
+                            # No qty on this line, just more text for whatever we are building
+                            cur_item['item'].extend(r_item)
+                            cur_item['v'].extend(r_v)
+                            if cur_item['y'] is None: cur_item['y'] = ry
+                            
+                    # Final item cleanup
+                    if cur_item['item'] or cur_item['v']:
+                        items_found.append(cur_item)
+
+                    for itm in items_found:
+                        # VALIDATION: An item MUST have a quantity to be valid
+                        if itm['qty'] is None: continue
+                        
+                        item_t = self.clean_thai_text(" ".join(itm['item']))
+                        v_t = self.clean_thai_text(" ".join(itm['v']))
+                        
+                        if not item_t and not v_t: continue
+                        if len(item_t) < 2 and not v_t: continue 
+                        
+                        qty = itm['qty']
+                        y_pos = itm['y']
+                        
+                        item_n, v_n = self._normalize_for_match(item_t), self._normalize_for_match(v_t)
+                        best_c, best_s = "NOT FOUND", -9999
                         
                         for _, db_row in self.db.iterrows():
-                            db_i_norm = db_row.get('item_norm', '')
-                            db_v_norm = db_row.get('v_name_norm', '')
-                            if not db_i_norm: continue 
-
-                            item_score = 0
-                            if db_i_norm == item_norm: item_score = 1000 
-                            elif db_i_norm in item_norm or item_norm in db_i_norm: item_score = len(db_i_norm) 
-                            else: continue 
-                                
-                            v_score = 0
-                            if not v_ext and not db_v_norm: v_score = 1000 
-                            elif db_v_norm == v_norm: v_score = 1000 
-                            elif not db_v_norm: v_score = 0 
-                            elif db_v_norm in v_norm or v_norm in db_v_norm: v_score = len(db_v_norm) 
-                            else: continue 
-                                
-                            matched_code = str(db_row.get('code', '')).strip()
-                            total_score = item_score + v_score
-                            
-                            if not matched_code or matched_code.upper() == "NOT FOUND":
-                                total_score -= 5000 
-                            
-                            if total_score > best_score:
-                                best_score = total_score
-                                best_code = matched_code
-                            elif total_score == best_score:
-                                if matched_code.upper() != "NOT FOUND":
-                                    best_code = matched_code
-                                
-                        code = best_code if best_code else "NOT FOUND"
+                            db_i, db_v = db_row.get('item_norm', ''), db_row.get('v_name_norm', '')
+                            if not db_i: continue 
+                            i_s = 1000 if db_i == item_n else (len(db_i) if db_i in item_n or item_n in db_i else -1)
+                            if i_s < 0: continue
+                            v_s = 1000 if (not v_t and not db_v) or db_v == v_n else (len(db_v) if db_v and (db_v in v_n or v_n in db_v) else 0)
+                            score = i_s + v_s
+                            code = str(db_row.get('code', '')).strip()
+                            if not code or code.upper() == "NOT FOUND": score -= 5000 
+                            if score > best_s: best_s, best_c = score, code
                                     
                         all_results.append({
                             'page': page_num, 'file': os.path.basename(pdf_path),
-                            'item': item_ext, 'v_name': v_ext, 'qty': qty,
-                            'code': code, 'y_pos': header_y, 'file_path': pdf_path
+                            'item': item_t, 'v_name': v_t, 'qty': qty,
+                            'code': best_c, 'y_pos': y_pos, 'file_path': pdf_path
                         })
+
 
             # ปิดไฟล์ PDF แล้วส่งค่ากลับเลย (หั่นระบบ Tesseract ออกไปแล้ว)
             doc.close()
