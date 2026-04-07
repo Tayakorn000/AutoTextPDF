@@ -19,20 +19,126 @@ except ImportError:
 import shutil
 import sys
 
+import json
+import gspread
+import requests
+from oauth2client.service_account import ServiceAccountCredentials
+
+from reportlab.platypus import Paragraph
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+
 class PDFProcessor:
     def __init__(self, db_name='products_db.xlsx'):
         self.db_name = db_name
         self.db_path = self._get_persistent_db_path()
+        self.settings_path = os.path.join(os.path.dirname(self.db_path), 'settings.json')
         self._load_db()
-        if os.name == 'nt':
-            self.font_path = "C:\\Windows\\Fonts\\tahoma.ttf"
-            if not os.path.exists(self.font_path): self.font_path = "C:\\Windows\\Fonts\\arial.ttf"
-        else:
-            self.font_path = "/Library/Fonts/Thonburi.ttc"
-            if not os.path.exists(self.font_path): self.font_path = "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"
+        self._load_settings()
+
+        # --- Font Selection (Priority to fonts with good Thai vowel shaping) ---
+        possible_fonts = [
+            "C:\\Windows\\Fonts\\cordia.ttf",
+            "C:\\Windows\\Fonts\\thsarabunnew.ttf",
+            "C:\\Windows\\Fonts\\angsau.ttf",
+            "C:\\Windows\\Fonts\\tahoma.ttf"
+        ]
+        self.font_path = None
+        for f in possible_fonts:
+            if os.path.exists(f):
+                self.font_path = f
+                break
         
-        if not self.font_path or not os.path.exists(self.font_path):
-            self.font_path = None
+        if os.name != 'nt':
+            mac_font = "/Library/Fonts/Thonburi.ttc"
+            if os.path.exists(mac_font): self.font_path = mac_font
+
+    def _load_settings(self):
+        self.settings = {
+            "gsheet_url": "https://docs.google.com/spreadsheets/d/1qeVMcuJza_cqmXaxlHBrZpb_8gcSld-vXejMt8pRXcI/edit?usp=sharing",
+            "gsheet_creds_path": ""
+        }
+        
+        # ค้นหา credentials.json ในโฟลเดอร์โปรแกรมอัตโนมัติถ้ามี
+        default_creds = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
+        if os.path.exists(default_creds):
+            self.settings["gsheet_creds_path"] = default_creds
+
+        if os.path.exists(self.settings_path):
+            try:
+                with open(self.settings_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # กรองเอาเฉพาะค่าที่ยังใช้อยู่
+                    for k in ["gsheet_url", "gsheet_creds_path"]:
+                        if k in data: self.settings[k] = data[k]
+            except: pass
+
+    def save_settings(self, settings):
+        self.settings.update(settings)
+        try:
+            with open(self.settings_path, 'w', encoding='utf-8') as f:
+                json.dump(self.settings, f, indent=4, ensure_ascii=False)
+        except: pass
+
+    def update_stock_gsheet(self, item_name, variant_name, qty_to_reduce, code=None):
+        # --- ตรวจสอบและโหลดค่าเริ่มต้นหากในตัวแปรว่าง ---
+        if not self.settings.get("gsheet_url"):
+            self.settings["gsheet_url"] = "https://docs.google.com/spreadsheets/d/1qeVMcuJza_cqmXaxlHBrZpb_8gcSld-vXejMt8pRXcI/edit?usp=sharing"
+        
+        if not self.settings.get("gsheet_creds_path") or not os.path.exists(self.settings["gsheet_creds_path"]):
+            # พยายามหาในโฟลเดอร์เดียวกับโปรแกรมอีกรอบ
+            possible_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
+            if os.path.exists(possible_path):
+                self.settings["gsheet_creds_path"] = possible_path
+            else:
+                return False, "ไม่พบไฟล์ credentials.json ในโฟลเดอร์โปรแกรม"
+
+        try:
+            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+            creds = ServiceAccountCredentials.from_json_keyfile_name(self.settings["gsheet_creds_path"], scope)
+            gc = gspread.authorize(creds)
+            sh = gc.open_by_url(self.settings["gsheet_url"])
+            wks = sh.get_worksheet(0)
+            
+            # โหลดข้อมูลทั้งหมดมาเช็ค
+            # โครงสร้างใหม่: A=รหัสสินค้า, B=ชื่อสินค้า, C=รุ่น/แบบ, D=สต็อก
+            records = wks.get_all_records()
+            found_row = -1
+            current_stock = 0
+            
+            search_code = str(code).strip() if code else ""
+            item_n = self._normalize_for_match(item_name)
+            v_n = self._normalize_for_match(variant_name)
+
+            for i, row in enumerate(records, 2):
+                row_code = str(row.get("รหัสสินค้า", row.get("Code", ""))).strip()
+                row_item = self._normalize_for_match(row.get("ชื่อสินค้า", row.get("Item Name", "")))
+                row_var = self._normalize_for_match(row.get("รุ่น/แบบ", row.get("Variant", "")))
+                
+                # ค้นหาด้วยรหัสสินค้าเป็นหลัก ถ้าไม่มีรหัสค่อยใช้ชื่อ+รุ่น
+                if (search_code and row_code == search_code) or (not search_code and row_item == item_n and row_var == v_n):
+                    found_row = i
+                    stock_val = row.get("สต็อก", row.get("Stock", 0))
+                    try: current_stock = int(stock_val)
+                    except: current_stock = 0
+                    break
+            
+            if found_row != -1:
+                new_stock = current_stock - qty_to_reduce
+                # หาคอลัมน์สต็อก (คาดว่าเป็น D แต่หาจากชื่อหัวคอลัมน์เพื่อความแม่นยำ)
+                headers = wks.row_values(1)
+                stock_col = -1
+                for j, h in enumerate(headers, 1):
+                    if h.lower() in ["สต็อก", "stock"]:
+                        stock_col = j
+                        break
+                
+                if stock_col != -1:
+                    wks.update_cell(found_row, stock_col, new_stock)
+                    return True, new_stock
+            return False, "Item not found in sheet"
+        except Exception as e:
+            return False, str(e)
 
     def _get_persistent_db_path(self):
         if getattr(sys, 'frozen', False):
@@ -66,36 +172,44 @@ class PDFProcessor:
             try: pd.read_csv(csv_path).to_excel(self.db_path, index=False)
             except: pass
 
+        # New Column Order: code, item, v_name, has_manual, manual_text
+        cols = ['code', 'item', 'v_name', 'has_manual', 'manual_text']
+
         if os.path.exists(self.db_path):
             try:
                 self.db = pd.read_excel(self.db_path)
-                for col in ['item', 'v_name', 'code']:
+                for col in cols:
                     if col not in self.db.columns: self.db[col] = ''
                 
+                self.db['code'] = self.db['code'].fillna('').astype(str).str.strip().replace('nan', '')
                 self.db['item'] = self.db['item'].fillna('').astype(str).str.strip().replace('nan', '')
                 self.db['v_name'] = self.db['v_name'].fillna('').astype(str).str.strip().replace('nan', '')
-                self.db['code'] = self.db['code'].fillna('').astype(str).str.strip().replace('nan', '')
+                self.db['has_manual'] = pd.to_numeric(self.db['has_manual'], errors='coerce').fillna(0).astype(int)
+                self.db['manual_text'] = self.db['manual_text'].fillna('').astype(str).str.strip().replace('nan', '')
                 
                 self.db['item_norm'] = self.db['item'].apply(self._normalize_for_match)
                 self.db['v_name_norm'] = self.db['v_name'].apply(self._normalize_for_match)
 
-                self.db['_mk'] = self.db['item_norm'] + self.db['v_name_norm']
-                self.db = self.db.drop_duplicates(subset=['_mk'], keep='last').drop(columns=['_mk'])
+                # Use Code as Unique Key
+                self.db = self.db.drop_duplicates(subset=['code'], keep='last') if 'code' in self.db.columns else self.db
 
             except Exception as e:
                 print(f"Error loading DB: {e}")
-                self.db = pd.DataFrame(columns=['item', 'v_name', 'code', 'item_norm', 'v_name_norm'])
+                self.db = pd.DataFrame(columns=cols + ['item_norm', 'v_name_norm'])
         else:
-            self.db = pd.DataFrame(columns=['item', 'v_name', 'code', 'item_norm', 'v_name_norm'])
+            self.db = pd.DataFrame(columns=cols + ['item_norm', 'v_name_norm'])
 
     def clean_thai_text(self, text):
         if not text: return ""
         text = str(text)
         text = unicodedata.normalize('NFKC', text)
         text = thai_normalize(text)
-        noise = ["Order ID", "Total Amount", "No.", "Seller SKU", "Shopee Order No", "Package ID", "COD", "PICK-UP"]
+        # Only remove the noise labels themselves, not everything after them
+        noise = ["Order ID", "Total Amount", "Seller SKU", "Shopee Order No", "Package ID", "COD", "PICK-UP", "No.", "ชื่อสินค้า"]
         for n in noise:
-            text = re.sub(rf'{n}.*', '', text, flags=re.IGNORECASE)
+            # Use word boundaries and only remove the label part
+            text = re.sub(rf'{re.escape(n)}\s*:?\s*', ' ', text, flags=re.IGNORECASE)
+        
         text = re.sub(r'([\u0e00-\u0e7f])\s+([\u0e00-\u0e7f])', r'\1\2', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text
@@ -180,6 +294,60 @@ class PDFProcessor:
                 overlay_reader = PdfReader(packet)
                 page.merge_page(overlay_reader.pages[0])
                 writer.add_page(page)
+
+                # Check for manual pages
+                manuals_to_add = []
+                for order in orders_to_label[page_num]:
+                    if order.get('has_manual'):
+                        m_data = {
+                            'text': order.get('manual_text', 'Manual'),
+                            'code': order.get('code', 'N/A')
+                        }
+                        if m_data not in manuals_to_add:
+                            manuals_to_add.append(m_data)
+                
+                for m_info in manuals_to_add:
+                    m_text = m_info['text']
+                    
+                    manual_packet = io.BytesIO()
+                    m_can = canvas.Canvas(manual_packet, pagesize=(w, h))
+                    
+                    # --- Font Setup ---
+                    target_font = 'ThaiFont' if self.font_path else 'Helvetica'
+                    if self.font_path:
+                        try: pdfmetrics.registerFont(TTFont('ThaiFont', self.font_path))
+                        except: target_font = 'Helvetica'
+
+                    # --- Rich Text Processing ---
+                    # แปลงการเคาะบรรทัด (\n) ให้เป็นแท็ก <br/> ของ PDF
+                    formatted_text = m_text.replace("\n", "<br/>")
+                    
+                    # ตั้งค่า Style (ตัวหนา/เอียง/ขีดเส้นใต้ จะใช้แท็ก <b> <i> <u> ในข้อความได้เลย)
+                    style = ParagraphStyle(
+                        name='ManualStyle',
+                        fontName=target_font,
+                        fontSize=20,
+                        leading=24, # ระยะห่างระหว่างบรรทัด (ปกติจะมากกว่า fontSize เล็กน้อย)
+                        alignment=TA_CENTER,
+                        textColor='black'
+                    )
+
+
+                    # สร้าง Paragraph เพื่อรองรับ HTML Tags และแก้ปัญหาสระลอย
+                    p = Paragraph(formatted_text, style)
+                    
+                    # คำนวณขนาด (ใช้พื้นที่เกือบเต็มหน้ากระดาษ - ขอบแค่ 10)
+                    # สุดซ้ายขวา แต่ยังคงจัดกลาง
+                    side_margin = 10
+                    p_w, p_h = p.wrap(w - (side_margin * 2), h - 100)
+                    
+                    # วาดลงกึ่งกลางหน้าพอดี
+                    p.drawOn(m_can, (w - p_w) / 2, (h - p_h) / 2)
+
+                    m_can.save()
+                    manual_packet.seek(0)
+                    m_reader = PdfReader(manual_packet)
+                    writer.add_page(m_reader.pages[0])
             else:
                 writer.add_page(page)
                 
@@ -240,15 +408,15 @@ class PDFProcessor:
                 spans_sorted = sorted(spans, key=lambda x: x["y_center"])
                 for i, s in enumerate(spans_sorted):
                     txt = s["text"].lower().strip()
-                    # Look for Item header
-                    if "item" == txt or "รายการ" == txt:
+                    # Look for Item header - added more variations
+                    if any(x == txt for x in ["item", "รายการ", "รายการสินค้า", "ชื่อสินค้า", "product"]):
                         h_info = {"item_s": s, "qty_s": None, "v_name_s": None}
                         for s2 in spans:
                             if s2 == s: continue
                             txt2 = s2["text"].lower().strip()
                             if abs(s2["y_center"] - s["y_center"]) < 25: 
-                                if "qty" == txt2 or "จำนวน" == txt2: h_info["qty_s"] = s2
-                                if any(x == txt2 for x in ["v name", "v_name", "variant", "รุ่น", "แบบ"]): h_info["v_name_s"] = s2
+                                if any(x == txt2 for x in ["qty", "จำนวน", "จำนวนสินค้า", "quantity"]): h_info["qty_s"] = s2
+                                if any(x == txt2 for x in ["v name", "v_name", "variant", "รุ่น", "แบบ", "คุณสมบัติ", "sku"]): h_info["v_name_s"] = s2
                         if h_info["qty_s"]: headers.append(h_info)
                 
                 # If no headers found but we had them on previous page, create a virtual header for continuation
@@ -277,13 +445,15 @@ class PDFProcessor:
                     v_x = h_group["v_name_s"]["bbox"][0] if h_group["v_name_s"] else -1
                     
                     next_h_y = unique_headers[i+1]["item_s"]["y_center"] if i+1 < len(unique_headers) else page.rect.height
-                    zone_spans = sorted([s for s in spans if header_y + 5 < s["y_center"] < next_h_y - 5], key=lambda x: x["y_center"])
+                    # Use a smaller margin (+1 instead of +2) to avoid skipping the first line of data
+                    zone_spans = sorted([s for s in spans if header_y + 1 < s["y_center"] < next_h_y - 2], key=lambda x: x["y_center"])
                     
                     rows = []
                     if zone_spans:
                         cur_row = [zone_spans[0]]
                         for s_idx in range(1, len(zone_spans)):
-                            if abs(zone_spans[s_idx]["y_center"] - zone_spans[s_idx-1]["y_center"]) < 6:
+                            # Standard line height is ~12-15. 6-7 is a safe tolerance for 'same line'
+                            if abs(zone_spans[s_idx]["y_center"] - zone_spans[s_idx-1]["y_center"]) < 7:
                                 cur_row.append(zone_spans[s_idx])
                             else:
                                 rows.append(cur_row)
@@ -292,10 +462,32 @@ class PDFProcessor:
                     
                     items_found = []
                     cur_item = {'item': [], 'v': [], 'qty': None, 'y': None}
+                    prev_ry = None
                     
                     for row in rows:
                         r_item, r_v, r_qty = [], [], None
                         ry = row[0]["y_center"]
+                        row = sorted(row, key=lambda x: x["bbox"][0])
+                        
+                        # HEURISTIC: Detect if this row is likely the START of a new item
+                        starts_at_item_col = abs(row[0]["bbox"][0] - item_x) < 20
+                        
+                        # If there is a moderate vertical gap (> 22 pixels) OR
+                        # it starts at the item column and we already have a quantity for the previous item,
+                        # it's likely a new item.
+                        is_new_item_start = False
+                        if prev_ry is not None:
+                            gap = ry - prev_ry
+                            if gap > 22: is_new_item_start = True
+                            elif starts_at_item_col and cur_item['qty'] is not None and gap > 15:
+                                is_new_item_start = True
+                        
+                        if is_new_item_start:
+                            if cur_item['item'] or cur_item['v']:
+                                items_found.append(cur_item)
+                                cur_item = {'item': [], 'v': [], 'qty': None, 'y': None}
+                        
+                        prev_ry = ry
                         row = sorted(row, key=lambda x: x["bbox"][0])
                         
                         for s in row:
@@ -304,17 +496,25 @@ class PDFProcessor:
                             x = s["bbox"][0]
                             
                             # Find which header this text is closest to horizontally
-                            dists = [('item', abs(x - item_x)), ('qty', abs(x - qty_x))]
+                            d_item = abs(x - item_x)
+                            d_qty = abs(x - qty_x)
+                            dists = [('item', d_item), ('qty', d_qty)]
                             if v_x != -1: dists.append(('v', abs(x - v_x)))
                             
                             closest_col = min(dists, key=lambda d: d[1])[0]
                             
+                            # Refinement: Only treat as 'qty' if it's reasonably close to the qty column
+                            # and not closer to the item/variant column if they are far apart.
+                            if closest_col == 'qty' and d_qty > 150: # Too far from qty header
+                                if v_x != -1 and abs(x - v_x) < d_item: closest_col = 'v'
+                                else: closest_col = 'item'
+
                             if closest_col == 'qty':
                                 m = re.search(r'(?:x\s*)?(\d+)', t, re.IGNORECASE)
-                                if m and (len(t) < 5 or t.lower().startswith('x')):
+                                # Qty should be short and mostly numeric
+                                if m and (len(t) < 6 or t.lower().startswith('x')):
                                     r_qty = int(m.group(1))
                                 else:
-                                    # If not a clear number, fallback to Item or Variant based on other headers
                                     if v_x != -1 and abs(x - v_x) < abs(x - item_x): r_v.append(t)
                                     else: r_item.append(t)
                             elif closest_col == 'v':
@@ -360,6 +560,9 @@ class PDFProcessor:
                         item_n, v_n = self._normalize_for_match(item_t), self._normalize_for_match(v_t)
                         best_c, best_s = "NOT FOUND", -9999
                         
+                        best_c, best_s = "NOT FOUND", -9999
+                        has_manual, manual_text = 0, ""
+                        
                         for _, db_row in self.db.iterrows():
                             db_i, db_v = db_row.get('item_norm', ''), db_row.get('v_name_norm', '')
                             if not db_i: continue 
@@ -369,12 +572,16 @@ class PDFProcessor:
                             score = i_s + v_s
                             code = str(db_row.get('code', '')).strip()
                             if not code or code.upper() == "NOT FOUND": score -= 5000 
-                            if score > best_s: best_s, best_c = score, code
+                            if score > best_s: 
+                                best_s, best_c = score, code
+                                has_manual = int(db_row.get('has_manual', 0))
+                                manual_text = str(db_row.get('manual_text', '')).strip()
                                     
                         all_results.append({
                             'page': page_num, 'file': os.path.basename(pdf_path),
                             'item': item_t, 'v_name': v_t, 'qty': qty,
-                            'code': best_c, 'y_pos': y_pos, 'file_path': pdf_path
+                            'code': best_c, 'y_pos': y_pos, 'file_path': pdf_path,
+                            'has_manual': has_manual, 'manual_text': manual_text
                         })
 
 
@@ -408,22 +615,27 @@ class PDFProcessor:
             return False, 0
         except Exception as e: return False, str(e)
 
-    def save_to_db(self, item, v_name, code, old_item=None, old_v_name=None):
+    def save_to_db(self, item, v_name, code, has_manual=0, manual_text="", old_item=None, old_v_name=None):
         if not item: return False, "No item name"
         item = self.clean_thai_text(item)
         v_name = self.clean_thai_text(v_name)
         code = str(code).strip() 
         
-        new_row = {'item': item, 'v_name': v_name, 'code': code}
+        new_row = {
+            'item': item, 'v_name': v_name, 'code': code,
+            'has_manual': int(has_manual), 'manual_text': str(manual_text).strip()
+        }
         
         try:
             if os.path.exists(self.db_path):
                 df = pd.read_excel(self.db_path)
-                for col in ['item', 'v_name', 'code']:
+                for col in ['item', 'v_name', 'code', 'has_manual', 'manual_text']:
                     if col not in df.columns: df[col] = ''
                 df['item'] = df['item'].fillna('').astype(str)
                 df['v_name'] = df['v_name'].fillna('').astype(str)
                 df['code'] = df['code'].fillna('').astype(str)
+                df['has_manual'] = pd.to_numeric(df['has_manual'], errors='coerce').fillna(0).astype(int)
+                df['manual_text'] = df['manual_text'].fillna('').astype(str)
                 
                 t_item = old_item if old_item is not None else item
                 t_v = old_v_name if old_v_name is not None else v_name
@@ -451,7 +663,7 @@ class PDFProcessor:
             df = df.drop_duplicates(subset=['_match_i', '_match_v'], keep='last')
             df = df.drop(columns=['_match_i', '_match_v'], errors='ignore')
 
-            cols = ['item', 'v_name', 'code']
+            cols = ['item', 'v_name', 'code', 'has_manual', 'manual_text']
             other_cols = [c for c in df.columns if c not in cols and not c.startswith('_')]
             df = df[cols + other_cols]
 
