@@ -19,11 +19,6 @@ except ImportError:
 import shutil
 import sys
 
-import json
-import gspread
-import requests
-from oauth2client.service_account import ServiceAccountCredentials
-
 from reportlab.platypus import Paragraph
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
@@ -32,9 +27,7 @@ class PDFProcessor:
     def __init__(self, db_name='products_db.xlsx'):
         self.db_name = db_name
         self.db_path = self._get_persistent_db_path()
-        self.settings_path = os.path.join(os.path.dirname(self.db_path), 'settings.json')
         self._load_db()
-        self._load_settings()
 
         # --- Font Selection (Priority to fonts with good Thai vowel shaping) ---
         possible_fonts = [
@@ -52,93 +45,6 @@ class PDFProcessor:
         if os.name != 'nt':
             mac_font = "/Library/Fonts/Thonburi.ttc"
             if os.path.exists(mac_font): self.font_path = mac_font
-
-    def _load_settings(self):
-        self.settings = {
-            "gsheet_url": "https://docs.google.com/spreadsheets/d/1qeVMcuJza_cqmXaxlHBrZpb_8gcSld-vXejMt8pRXcI/edit?usp=sharing",
-            "gsheet_creds_path": ""
-        }
-        
-        # ค้นหา credentials.json ในโฟลเดอร์โปรแกรมอัตโนมัติถ้ามี
-        default_creds = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
-        if os.path.exists(default_creds):
-            self.settings["gsheet_creds_path"] = default_creds
-
-        if os.path.exists(self.settings_path):
-            try:
-                with open(self.settings_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    # กรองเอาเฉพาะค่าที่ยังใช้อยู่
-                    for k in ["gsheet_url", "gsheet_creds_path"]:
-                        if k in data: self.settings[k] = data[k]
-            except: pass
-
-    def save_settings(self, settings):
-        self.settings.update(settings)
-        try:
-            with open(self.settings_path, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, indent=4, ensure_ascii=False)
-        except: pass
-
-    def update_stock_gsheet(self, item_name, variant_name, qty_to_reduce, code=None):
-        # --- ตรวจสอบและโหลดค่าเริ่มต้นหากในตัวแปรว่าง ---
-        if not self.settings.get("gsheet_url"):
-            self.settings["gsheet_url"] = "https://docs.google.com/spreadsheets/d/1qeVMcuJza_cqmXaxlHBrZpb_8gcSld-vXejMt8pRXcI/edit?usp=sharing"
-        
-        if not self.settings.get("gsheet_creds_path") or not os.path.exists(self.settings["gsheet_creds_path"]):
-            # พยายามหาในโฟลเดอร์เดียวกับโปรแกรมอีกรอบ
-            possible_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'credentials.json')
-            if os.path.exists(possible_path):
-                self.settings["gsheet_creds_path"] = possible_path
-            else:
-                return False, "ไม่พบไฟล์ credentials.json ในโฟลเดอร์โปรแกรม"
-
-        try:
-            scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-            creds = ServiceAccountCredentials.from_json_keyfile_name(self.settings["gsheet_creds_path"], scope)
-            gc = gspread.authorize(creds)
-            sh = gc.open_by_url(self.settings["gsheet_url"])
-            wks = sh.get_worksheet(0)
-            
-            # โหลดข้อมูลทั้งหมดมาเช็ค
-            # โครงสร้างใหม่: A=รหัสสินค้า, B=ชื่อสินค้า, C=รุ่น/แบบ, D=สต็อก
-            records = wks.get_all_records()
-            found_row = -1
-            current_stock = 0
-            
-            search_code = str(code).strip() if code else ""
-            item_n = self._normalize_for_match(item_name)
-            v_n = self._normalize_for_match(variant_name)
-
-            for i, row in enumerate(records, 2):
-                row_code = str(row.get("รหัสสินค้า", row.get("Code", ""))).strip()
-                row_item = self._normalize_for_match(row.get("ชื่อสินค้า", row.get("Item Name", "")))
-                row_var = self._normalize_for_match(row.get("รุ่น/แบบ", row.get("Variant", "")))
-                
-                # ค้นหาด้วยรหัสสินค้าเป็นหลัก ถ้าไม่มีรหัสค่อยใช้ชื่อ+รุ่น
-                if (search_code and row_code == search_code) or (not search_code and row_item == item_n and row_var == v_n):
-                    found_row = i
-                    stock_val = row.get("สต็อก", row.get("Stock", 0))
-                    try: current_stock = int(stock_val)
-                    except: current_stock = 0
-                    break
-            
-            if found_row != -1:
-                new_stock = current_stock - qty_to_reduce
-                # หาคอลัมน์สต็อก (คาดว่าเป็น D แต่หาจากชื่อหัวคอลัมน์เพื่อความแม่นยำ)
-                headers = wks.row_values(1)
-                stock_col = -1
-                for j, h in enumerate(headers, 1):
-                    if h.lower() in ["สต็อก", "stock"]:
-                        stock_col = j
-                        break
-                
-                if stock_col != -1:
-                    wks.update_cell(found_row, stock_col, new_stock)
-                    return True, new_stock
-            return False, "Item not found in sheet"
-        except Exception as e:
-            return False, str(e)
 
     def _get_persistent_db_path(self):
         if getattr(sys, 'frozen', False):

@@ -11,56 +11,6 @@ from PySide6.QtGui import QKeySequence, QShortcut, QClipboard, QAction
 
 from processor import PDFProcessor
 
-class SettingsDialog(QDialog):
-    def __init__(self, parent=None, settings=None):
-        super().__init__(parent)
-        self.setWindowTitle("Settings (Google Sheets)")
-        self.resize(550, 200)
-        self.settings = settings or {}
-        
-        self.setStyleSheet("""
-            QDialog { background-color: #242424; color: white; }
-            QLabel { color: white; font-weight: bold; }
-            QLineEdit { background-color: #1a1a1a; color: white; border: 1px solid #555; padding: 5px; }
-            QPushButton { background-color: #343a40; color: white; border: 1px solid #555; padding: 8px; border-radius: 4px; }
-            QPushButton:hover { background-color: #495057; }
-        """)
-        
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        
-        self.gsheet_url = QLineEdit(self.settings.get("gsheet_url", ""))
-        self.gsheet_creds = QLineEdit(self.settings.get("gsheet_creds_path", ""))
-        
-        btn_browse = QPushButton("Browse...")
-        btn_browse.clicked.connect(self._browse_creds)
-        
-        creds_layout = QHBoxLayout()
-        creds_layout.addWidget(self.gsheet_creds)
-        creds_layout.addWidget(btn_browse)
-        
-        form.addRow("Google Sheet URL:", self.gsheet_url)
-        form.addRow("Credentials (.json):", creds_layout)
-        
-        layout.addLayout(form)
-        layout.addSpacing(20)
-        
-        btn_save = QPushButton("Save Settings")
-        btn_save.setStyleSheet("background-color: #28a745; font-weight: bold;")
-        btn_save.clicked.connect(self.accept)
-        layout.addWidget(btn_save)
-        
-    def _browse_creds(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Select Credentials JSON", "", "JSON files (*.json)")
-        if fname:
-            self.gsheet_creds.setText(fname)
-            
-    def get_settings(self):
-        return {
-            "gsheet_url": self.gsheet_url.text().strip(),
-            "gsheet_creds_path": self.gsheet_creds.text().strip()
-        }
-
 class MultilineInputDialog(QDialog):
     def __init__(self, parent=None, title="Edit Content", initial_value="", show_toolbar=True):
         super().__init__(parent)
@@ -245,12 +195,6 @@ class PDFLabelerApp(QMainWindow):
         btn_reload_db.setStyleSheet("background-color: #17a2b8; font-weight: bold;")
         btn_reload_db.clicked.connect(self._reload_db)
         sidebar_layout.addWidget(btn_reload_db)
-        
-        btn_settings = QPushButton("Google Sheets / Discord")
-        btn_settings.setMinimumHeight(40)
-        btn_settings.setStyleSheet("background-color: #6c757d; font-weight: bold;")
-        btn_settings.clicked.connect(self._open_settings)
-        sidebar_layout.addWidget(btn_settings)
         
         sidebar_layout.addSpacing(10)
         
@@ -546,20 +490,12 @@ class PDFLabelerApp(QMainWindow):
         if saved_count > 0:
             QMessageBox.information(self, "Saved", f"Database updated ({saved_count} items).")
 
-    def _open_settings(self):
-        dialog = SettingsDialog(self, self.processor.settings)
-        if dialog.exec() == QDialog.Accepted:
-            new_settings = dialog.get_settings()
-            self.processor.save_settings(new_settings)
-            self._log("Settings saved.")
-
     def _label_pdfs(self):
         if self.table.rowCount() == 0:
             QMessageBox.warning(self, "Warning", "No orders in the list to label.")
             return
             
         file_to_pages = defaultdict(lambda: defaultdict(list))
-        items_to_decrement = []
         
         for row in range(self.table.rowCount()):
             code = self.table.item(row, 6).text() if self.table.item(row, 6) else ""
@@ -583,12 +519,6 @@ class PDFLabelerApp(QMainWindow):
                     'has_manual': has_manual,
                     'manual_text': manual_text
                 })
-                items_to_decrement.append({
-                    'item': item_name,
-                    'variant': variant_name,
-                    'qty': qty,
-                    'code': code
-                })
 
         if not file_to_pages:
             QMessageBox.warning(self, "No Matches", "No matching codes found in DB to draw.")
@@ -603,18 +533,8 @@ class PDFLabelerApp(QMainWindow):
             result_path = self.processor.add_labels_to_pdf(file_path, output_path, pages_dict)
             output_files.append(result_path)
 
-        # Update Stock in Google Sheets
-        if items_to_decrement:
-            self._log("Updating stock in Google Sheets...")
-            for itm in items_to_decrement:
-                success, result = self.processor.update_stock_gsheet(itm['item'], itm['variant'], itm['qty'])
-                if success:
-                    self._log(f"Stock updated for {itm['variant']}: {result} remaining")
-                else:
-                    self._log(f"Failed to update stock for {itm['variant']}: {result}")
-
         if output_files:
-            QMessageBox.information(self, "Success", f"Labelled {len(output_files)} files and updated stock.\nList cleared.")
+            QMessageBox.information(self, "Success", f"Labelled {len(output_files)} files.\nList cleared.")
             self._clear_table()
             try:
                 if os.name == 'nt': os.startfile(output_files[0])
